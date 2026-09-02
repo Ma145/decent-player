@@ -5,7 +5,8 @@
  * Pipeline architecture:
  * - Pre-allocated ring buffer of 64 URB slots
  * - Each URB = 8 ISO packets (1ms of audio at high-speed)
- * - URBs complete in FIFO order (ISO_ASAP guarantees this)
+ * - Completions are matched to their slot by URB pointer, so a host
+ *   controller that retires URBs out of order cannot desync the ring
  * - No malloc/free during streaming — avoids MTE pointer tag issues
  */
 
@@ -57,6 +58,21 @@ struct UrbSlot {
 
     /** Actual number of bytes written to buffer for current submission. */
     int dataLength;
+
+    /**
+     * True between a successful SUBMITURB and the reap that matched this slot
+     * by URB pointer. A slot is refilled only while this is false, so an
+     * out-of-order completion can never let the next write scribble over a
+     * buffer the host controller still owns.
+     */
+    bool inFlight;
+
+    /**
+     * Monotonic submission order. Ring positions stop reflecting submission
+     * order as soon as one URB completes early and its slot is reused, so
+     * "which URB was due next" is answered from this, not from the index.
+     */
+    uint64_t sequence;
 };
 
 /**
@@ -90,11 +106,32 @@ struct UsbAudioContext {
     /** Index of next slot to fill and submit (wraps modulo NUM_URBS). */
     int submitIdx;
 
-    /** Index of next slot to reap (wraps modulo NUM_URBS). */
+    /**
+     * Slot holding the oldest outstanding URB, so the pointer comparison on
+     * the reap path usually hits on the first try. A hint, not an assumption:
+     * every reaped URB is matched to its slot by pointer and this index is
+     * recomputed after each completion.
+     */
     int reapIdx;
 
-    /** Number of URBs currently submitted and not yet reaped. */
+    /** Number of URBs currently submitted and not yet reaped. Never negative. */
     int urbsInFlight;
+
+    /** Sequence stamped onto the next submitted URB. */
+    uint64_t nextSequence;
+
+    /** Audio URBs that completed in a different order than they were submitted. */
+    int64_t outOfOrderReaps;
+
+    /** Completions whose pointer belongs to no slot in this ring. */
+    int64_t staleCompletions;
+
+    /** Writes that had to step past a slot still owned by the controller. */
+    int64_t skippedBusySlots;
+
+    /** Log the first occurrence of each anomaly only; the rest are counted. */
+    bool loggedOutOfOrder;
+    bool loggedSkippedSlot;
 
     /** Whether ring buffers have been allocated. */
     bool ringAllocated;

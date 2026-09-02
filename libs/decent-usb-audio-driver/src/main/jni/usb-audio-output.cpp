@@ -6,8 +6,9 @@
  * No malloc/free during streaming — completely avoids ARM MTE pointer tag
  * issues on Samsung devices.
  *
- * ISO URBs with ISO_ASAP complete in FIFO order, so we use a simple ring
- * with submit/reap indices. No need to identify which URB was reaped.
+ * ISO URBs with ISO_ASAP normally complete in FIFO order, but REAPURBNDELAY
+ * makes no such promise, so every completion is matched to its slot by URB
+ * pointer and the reap cursor follows whatever actually completed.
  */
 
 #include "usb-audio-output.h"
@@ -88,6 +89,8 @@ static bool allocRing(UsbAudioContext *ctx) {
         ctx->ring[i].urb = (struct usbdevfs_urb *)calloc(1, urbStructSize);
         ctx->ring[i].buffer = (uint8_t *)malloc(USB_AUDIO_URB_BUFFER_SIZE);
         ctx->ring[i].dataLength = 0;
+        ctx->ring[i].inFlight = false;
+        ctx->ring[i].sequence = 0;
         if (!ctx->ring[i].urb || !ctx->ring[i].buffer) {
             LOGE("allocRing: OOM at slot %d", i);
             // Free what we allocated
@@ -223,12 +226,68 @@ static void handleFeedbackCompletion(UsbAudioContext *ctx) {
 // ── ISO URB submission / reap ───────────────────────────────────────
 
 /**
- * Submit the URB at ring[submitIdx] with the given packet layout.
+ * Locate a completed URB in the ring by pointer. Returns the slot index, or
+ * -1 when the pointer belongs to no slot — a stale completion left over from
+ * an earlier stream on the same file descriptor.
+ *
+ * The fast path is the single comparison against the expected slot, so the
+ * linear scan only runs when a completion actually arrives out of order.
+ */
+static int findSlotByUrb(const UsbAudioContext *ctx, const struct usbdevfs_urb *u) {
+    if (ctx->ring[ctx->reapIdx].urb == u) return ctx->reapIdx;
+    for (int i = 0; i < USB_AUDIO_NUM_URBS; i++) {
+        if (ctx->ring[i].urb == u) return i;
+    }
+    return -1;
+}
+
+/**
+ * Slot holding the outstanding URB that was submitted first, or -1 when
+ * nothing is in flight. Submission order lives in the sequence stamp, not in
+ * the ring position, because skipping a busy slot breaks positional order.
+ */
+static int oldestInFlightSlot(const UsbAudioContext *ctx) {
+    int oldest = -1;
+    for (int i = 0; i < USB_AUDIO_NUM_URBS; i++) {
+        if (!ctx->ring[i].inFlight) continue;
+        if (oldest < 0 || ctx->ring[i].sequence < ctx->ring[oldest].sequence) oldest = i;
+    }
+    return oldest;
+}
+
+/**
+ * Next slot the controller does not own, starting at the submit cursor.
+ * Returns -1 when every slot is still in flight, which the caller prevents by
+ * reaping first. Skipping is only possible after an out-of-order completion.
+ */
+static int findFreeSlot(UsbAudioContext *ctx) {
+    for (int step = 0; step < USB_AUDIO_NUM_URBS; step++) {
+        int slot = (ctx->submitIdx + step) % USB_AUDIO_NUM_URBS;
+        if (!ctx->ring[slot].inFlight) {
+            if (step > 0) {
+                ctx->skippedBusySlots++;
+                if (!ctx->loggedSkippedSlot) {
+                    ctx->loggedSkippedSlot = true;
+                    LOGW("submit cursor skipped %d slot(s) still owned by the host "
+                         "controller; further occurrences are counted, not logged", step);
+                }
+            }
+            return slot;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Submit ring[slotIdx] with the given packet layout. The caller has already
+ * filled that slot's buffer.
+ * @param slotIdx     Free slot chosen by findFreeSlot()
  * @param numPackets  Actual number of packets (no zero-length padding)
  * Returns 0 on success, -1 on error.
  */
-static int submitRingUrb(UsbAudioContext *ctx, const int *pktSizes, int numPackets, int totalBytes) {
-    UrbSlot *slot = &ctx->ring[ctx->submitIdx];
+static int submitRingUrb(UsbAudioContext *ctx, int slotIdx,
+                         const int *pktSizes, int numPackets, int totalBytes) {
+    UrbSlot *slot = &ctx->ring[slotIdx];
     struct usbdevfs_urb *u = slot->urb;
 
     // Clear the full URB struct including iso_frame_desc (stale actual_length/status)
@@ -250,25 +309,32 @@ static int submitRingUrb(UsbAudioContext *ctx, const int *pktSizes, int numPacke
     int ret = ioctl(ctx->fd, USBDEVFS_SUBMITURB, u);
     if (ret < 0) {
         LOGE("SUBMITURB FAILED slot=%d ep=0x%02x bytes=%d pkts=%d errno=%d (%s)",
-             ctx->submitIdx, ctx->endpointOut, totalBytes, numPackets, errno, strerror(errno));
+             slotIdx, ctx->endpointOut, totalBytes, numPackets, errno, strerror(errno));
         return -1;
     }
 
-    ctx->submitIdx = (ctx->submitIdx + 1) % USB_AUDIO_NUM_URBS;
+    slot->inFlight = true;
+    slot->sequence = ctx->nextSequence++;
+    ctx->submitIdx = (slotIdx + 1) % USB_AUDIO_NUM_URBS;
     ctx->urbsInFlight++;
     return 0;
 }
 
 /**
- * Reap the oldest submitted URB (at ring[reapIdx]).
- * ISO URBs with ISO_ASAP complete in FIFO order, so we always reap
- * the oldest one.
+ * Reap one audio URB.
  *
- * IMPORTANT: REAPURBNDELAY returns ANY completed URB — audio or feedback.
- * If we get a feedback URB, we process it (update fpmf, resubmit) and
- * retry. This implements continuous real-time clock calibration on the
- * same thread as audio URB recycling — no second thread, no extra
- * synchronization.
+ * IMPORTANT: REAPURBNDELAY returns ANY completed URB — audio or feedback,
+ * and in ANY order. If we get a feedback URB, we process it (update fpmf,
+ * resubmit) and retry. This implements continuous real-time clock
+ * calibration on the same thread as audio URB recycling — no second thread,
+ * no extra synchronization.
+ *
+ * Completion order is not assumed. ISO_ASAP normally retires URBs in
+ * submission order, but the reaped URB is always identified by pointer and
+ * the reap cursor is resynchronised to whatever actually completed. A
+ * mismatch is counted and logged once rather than silently shifting the ring
+ * — the old cursor-increment lost track of which slot the controller still
+ * owned, so a later write could refill a live buffer.
  *
  * @param timeoutMs  Maximum wait in milliseconds
  * @return 0 = success (audio URB reaped), -1 = error, -2 = timeout
@@ -287,9 +353,41 @@ static int reapOldestUrb(UsbAudioContext *ctx, int timeoutMs) {
                 c = nullptr;  // retry — we need an audio URB
                 continue;
             }
-            // Audio URB reaped successfully
-            ctx->reapIdx = (ctx->reapIdx + 1) % USB_AUDIO_NUM_URBS;
+
+            int slot = findSlotByUrb(ctx, c);
+            if (slot < 0) {
+                // A completion from an earlier stream on this fd. Counting it
+                // as audio would drive urbsInFlight negative.
+                ctx->staleCompletions++;
+                LOGW("reapOldestUrb: completion %p outside this ring, ignoring", c);
+                c = nullptr;
+                continue;
+            }
+            if (!ctx->ring[slot].inFlight) {
+                // A slot cannot complete twice.
+                ctx->staleCompletions++;
+                c = nullptr;
+                continue;
+            }
+
+            int oldest = oldestInFlightSlot(ctx);
+            if (oldest >= 0 && oldest != slot) {
+                ctx->outOfOrderReaps++;
+                if (!ctx->loggedOutOfOrder) {
+                    ctx->loggedOutOfOrder = true;
+                    LOGW("reapOldestUrb: ISO URBs completed out of order — oldest "
+                         "outstanding was slot %d, got slot %d. The cursor follows "
+                         "the completion; further occurrences are counted, not logged.",
+                         oldest, slot);
+                }
+            }
+
+            ctx->ring[slot].inFlight = false;
             ctx->urbsInFlight--;
+            // Re-aim at whatever is now oldest, so one transient reorder does
+            // not leave every later reap looking unexpected.
+            int next = oldestInFlightSlot(ctx);
+            ctx->reapIdx = next >= 0 ? next : (slot + 1) % USB_AUDIO_NUM_URBS;
             return 0;
         }
         if (ret < 0 && errno != EAGAIN) {
@@ -314,10 +412,26 @@ static int drainAllUrbs(UsbAudioContext *ctx) {
     // Discard the feedback URB first so it doesn't interfere with draining
     if (ctx->feedbackInFlight && ctx->feedbackUrb) {
         ioctl(ctx->fd, USBDEVFS_DISCARDURB, ctx->feedbackUrb);
-        struct usbdevfs_urb *c = nullptr;
         for (int i = 0; i < 50; i++) {
-            if (ioctl(ctx->fd, USBDEVFS_REAPURBNDELAY, &c) == 0 && c == ctx->feedbackUrb) {
-                break;
+            // Reset per-iteration state: a stale `c` from the previous pass
+            // would otherwise be re-examined when the ioctl fails.
+            struct usbdevfs_urb *c = nullptr;
+            if (ioctl(ctx->fd, USBDEVFS_REAPURBNDELAY, &c) == 0 && c != nullptr) {
+                if (c == ctx->feedbackUrb) break;
+                // REAPURBNDELAY serves every endpoint, so audio URBs surface
+                // while we wait for the feedback one. They must be accounted
+                // for here — otherwise their slots stay marked in flight and
+                // the phase below waits on URBs that are already gone, then
+                // discards and double-counts them.
+                int slot = findSlotByUrb(ctx, c);
+                if (slot >= 0 && ctx->ring[slot].inFlight) {
+                    ctx->ring[slot].inFlight = false;
+                    ctx->urbsInFlight--;
+                    drained++;
+                } else {
+                    ctx->staleCompletions++;
+                }
+                continue;
             }
             usleep(100);
         }
@@ -338,11 +452,16 @@ static int drainAllUrbs(UsbAudioContext *ctx) {
         LOGW("drainAllUrbs: %d/%d reaped naturally, discarding remaining %d",
              drained, initialCount, ctx->urbsInFlight);
 
-        // Phase 2: DISCARD all remaining URBs first
+        // Phase 2: DISCARD all remaining URBs first.
+        // Discard by slot state, not by an assumed contiguous run starting at
+        // reapIdx: after an out-of-order completion the outstanding slots are
+        // not contiguous, and the old loop discarded slots the controller had
+        // already returned while leaving live ones queued.
         int toDiscard = ctx->urbsInFlight;
-        for (int i = 0; i < toDiscard; i++) {
-            int slotIdx = (ctx->reapIdx + i) % USB_AUDIO_NUM_URBS;
-            ioctl(ctx->fd, USBDEVFS_DISCARDURB, ctx->ring[slotIdx].urb);
+        for (int slotIdx = 0; slotIdx < USB_AUDIO_NUM_URBS; slotIdx++) {
+            if (ctx->ring[slotIdx].inFlight) {
+                ioctl(ctx->fd, USBDEVFS_DISCARDURB, ctx->ring[slotIdx].urb);
+            }
         }
 
         // Phase 3: Reap ALL pending completions from the event ring.
@@ -379,12 +498,27 @@ static int drainAllUrbs(UsbAudioContext *ctx) {
         }
     }
 
-    // Reset ring to clean state
+    // Reset ring to clean state. Every slot is free again: whatever the
+    // kernel still held was discarded above, and leaving inFlight set would
+    // make findFreeSlot() refuse slots for the rest of the device's life.
     ctx->urbsInFlight = 0;
     ctx->submitIdx = 0;
     ctx->reapIdx = 0;
+    ctx->nextSequence = 0;
+    for (int i = 0; i < USB_AUDIO_NUM_URBS; i++) {
+        ctx->ring[i].inFlight = false;
+        ctx->ring[i].sequence = 0;
+    }
+    // A drain is a stream boundary (stop, or alt=0 before a rate change), so
+    // the packet-splitting state must not survive into the next stream.
+    ctx->frameAccumulator = 0.0;
+    ctx->residualBytes = 0;
 
-    LOGI("drainAllUrbs: drained %d/%d, ring reset", drained, initialCount);
+    LOGI("drainAllUrbs: drained %d/%d, ring reset "
+         "(out-of-order=%lld, stale=%lld, skipped=%lld)",
+         drained, initialCount,
+         (long long)ctx->outOfOrderReaps, (long long)ctx->staleCompletions,
+         (long long)ctx->skippedBusySlots);
     return drained;
 }
 
@@ -421,6 +555,12 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioCreate(
     ctx->submitIdx = 0;
     ctx->reapIdx = 0;
     ctx->urbsInFlight = 0;
+    ctx->nextSequence = 0;
+    ctx->outOfOrderReaps = 0;
+    ctx->staleCompletions = 0;
+    ctx->skippedBusySlots = 0;
+    ctx->loggedOutOfOrder = false;
+    ctx->loggedSkippedSlot = false;
     ctx->ringAllocated = false;
     ctx->frameAccumulator = 0.0;
     ctx->calibratedFpmf = rate / 8000.0;
@@ -477,6 +617,11 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioStart(
     ctx->submitIdx = 0;
     ctx->reapIdx = 0;
     ctx->urbsInFlight = 0;
+    ctx->nextSequence = 0;
+    for (int i = 0; i < USB_AUDIO_NUM_URBS; i++) {
+        ctx->ring[i].inFlight = false;
+        ctx->ring[i].sequence = 0;
+    }
     ctx->frameAccumulator = 0.0;
     ctx->residualBytes = 0;
 
@@ -760,10 +905,18 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
             }
         }
 
-        UrbSlot *slot = &ctx->ring[ctx->submitIdx];
+        int slotIdx = findFreeSlot(ctx);
+        if (slotIdx < 0) {
+            LOGE("submitPcmToUrbs: no free slot despite inflight=%d of %d",
+                 ctx->urbsInFlight, USB_AUDIO_NUM_URBS);
+            ctx->running.store(false);
+            free(mergedBuf);
+            return;
+        }
+        UrbSlot *slot = &ctx->ring[slotIdx];
         memcpy(slot->buffer, data + offset, urbBytes);
 
-        if (submitRingUrb(ctx, pktSizes, numPackets, urbBytes) < 0) {
+        if (submitRingUrb(ctx, slotIdx, pktSizes, numPackets, urbBytes) < 0) {
             LOGE("submitPcmToUrbs: submit failed, stopping stream");
             ctx->running.store(false);
             free(mergedBuf);
