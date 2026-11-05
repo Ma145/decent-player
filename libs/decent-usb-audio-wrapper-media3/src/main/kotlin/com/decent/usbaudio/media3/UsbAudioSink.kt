@@ -269,7 +269,12 @@ class UsbAudioSink(
                 // to the correct position and resume it.
                 val engine = nativeEngine
                 if (engine != null && windowOffsetUs >= 0) {
-                    val flacPositionUs = presentationTimeUs - windowOffsetUs
+                    // After restoring a saved position, windowOffset is derived from a position
+                    // stored in milliseconds and can be off by a few microseconds: a seek to 0
+                    // then computed e.g. -27 µs and was ignored, so the track didn't restart.
+                    // Small negatives are the start of the track.
+                    val rawPositionUs = presentationTimeUs - windowOffsetUs
+                    val flacPositionUs = if (rawPositionUs in -1_000_000L until 0L) 0L else rawPositionUs
                     if (flacPositionUs >= 0) {
                         engine.seek(flacPositionUs)
                         if (isPlaying) engine.resume()
@@ -288,6 +293,19 @@ class UsbAudioSink(
             val engine = nativeEngine
             if (engine != null) {
                 if (engine.isRunning) {
+                    // The engine can be created on the main thread (onMediaItemTransition) while
+                    // this track's first buffer is already passing through here without an engine.
+                    // The start position was captured but nothing seeks the engine, so it stays
+                    // paused: silence after a track played through the ExoPlayer pipeline at the
+                    // same USB rate (e.g. a resampled one). Seek it here.
+                    if (engineNeedsInitialSeek && !usbStartMediaTimeNeedsInit && windowOffsetUs >= 0) {
+                        val startUs = maxOf(0L, usbStartMediaTimeUs - windowOffsetUs)
+                        engine.seek(startUs)
+                        if (isPlaying) engine.resume()
+                        engineNeedsInitialSeek = false
+                        if (nativeEngine?.isRunning == true) isNativeEngineActive = true
+                        Log.i(TAG, "Native engine late seek to ${startUs / 1000}ms (playing=$isPlaying)")
+                    }
                     buffer.position(buffer.limit())
                     return true
                 }
